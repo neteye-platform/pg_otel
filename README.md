@@ -3,6 +3,11 @@
 This plugin for PostgreSQL lets you export the query plan and instrumentation
 as OpenTelemetry spans.
 
+> [!WARNING]
+> This is still experimental for now. While we use it in development to debug
+> postgres performance, we do not give any guarantees for fitness in production
+> systems.
+
 This works by attaching to the PostgreSQL executor start and end hooks. In the
 start hook, it requests the instrumentation for the query plan for each query.
 This will cost some CPU and memory, but the overhead is minimal for most

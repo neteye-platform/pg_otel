@@ -37,6 +37,13 @@ mod pg19;
 #[cfg(feature = "pg19")]
 pub use pg19::*;
 
+#[cfg(all(feature = "pg18", feature = "pg19"))]
+const _: () = {
+    compile_error!(
+        "Cannot have enabled more than one postgres version. Make sure to pass only one `--feature pg<version>` and `--no-default-features` to disable `pg19`."
+    )
+};
+
 /// The accumulated measurements of one plan node, in nanoseconds and counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct NodeStats {
