@@ -8,6 +8,8 @@
 //! * [`query_total_ns`] is the time the statement spent executing.
 //! * [`node_instrument`] reads the finished instrumentation of a plan node.
 //! * [`subplan_display_name`] names a sub-plan the way `EXPLAIN` does.
+//! * [`install_planner_hook`] installs the hook that times planning; its signature
+//!   differs between the versions.
 //! * [`log_min_messages_slot`] finds the `log_min_messages` setting of this
 //!   backend.
 //!
@@ -22,6 +24,7 @@
 //! | per-node instrumentation | `Instrumentation`, times as `double` seconds | `NodeInstrumentation`, times as `instr_time` |
 //! | statement instrumentation | `QueryDesc.totaltime`, allocated by the hook after `ExecutorStart` | `QueryDesc.query_instr`, requested with `query_instr_options` before |
 //! | sub-plan names | `SubPlan.plan_name` is complete (`InitPlan 1`) | `plan_name` is bare; `isInitPlan` and `subLinkType` say what it is |
+//! | `planner_hook` | 4 arguments | extra `ExplainState *es` argument |
 //! | `log_min_messages` | one `int` | an array with one level per backend type |
 
 // Exactly one of `pg18` and `pg19` must be enabled. That is enforced by

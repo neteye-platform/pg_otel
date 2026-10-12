@@ -14,6 +14,7 @@ use crate::{
 mod codec;
 mod compat;
 mod config;
+mod planning;
 mod postgres;
 mod queue;
 mod sanitize;
@@ -45,6 +46,8 @@ pub extern "C-unwind" fn _PG_init() {
     reserve_guc_prefix();
 
     shared::install_hooks();
+    compat::install_planner_hook();
+    planning::register_callbacks();
 
     BackgroundWorkerBuilder::new(WORKER_NAME)
         .set_function("background_worker_main")

@@ -65,8 +65,8 @@ pg_otel.min_duration_ms = 0 # -1 (default) disables tracing, 0 traces every stat
 | `pg_otel.otlp_ca_certificate` | string | unset | config file / reload | Path to a custom CA certificate. |
 | `pg_otel.service_name` | string | `postgresql` | config file / reload | `service.name` resource attribute. |
 | `pg_otel.traceparent` | string | unset | any user, per session/transaction | W3C `traceparent` of the parent span. See [Usage](#usage). |
-| `pg_otel.query_text` | enum | `normalized` | **superuser** (or roles granted `SET` on the parameter) | `off`: no query text. `normalized`: literals are replaced with placeholders (quoted identifiers such as `"My Table"` are kept as is). `raw`: the query text as received (may contain sensitive data). With `normalized`, databases whose encoding is not UTF-8 (for example `SQL_ASCII`) produce no query text, because normalization fails closed. |
-| `pg_otel.min_duration_ms` | int (ms) | `-1` | **superuser** (or roles granted `SET` on the parameter) | Only export spans for statements that run at least this long. `-1` disables tracing, `0` traces every statement. Restricted to superusers so that regular users cannot force tracing of everything. |
+| `pg_otel.query_text` | enum | `normalized` | **superuser** (or roles granted `SET` on the parameter) | `off`: no `db.query.text` attribute. `normalized`: literals are replaced with placeholders (quoted identifiers such as `"My Table"` are kept as is). `raw`: the query text as received (may contain sensitive data). The root span name always uses normalized text. When normalization fails (for example on `SQL_ASCII`), the name falls back to the operation and `normalized` produces no query text. |
+| `pg_otel.min_duration_ms` | int (ms) | `-1` | **superuser** (or roles granted `SET` on the parameter) | Only export spans for statements whose planning plus execution takes at least this long. `-1` disables tracing, `0` traces every statement. Restricted to superusers so that regular users cannot force tracing of everything. |
 | `pg_otel.max_plan_spans` | int | `1000` | **superuser** (or roles granted `SET` on the parameter) | Most plan node spans exported per statement (0 to 100000; 0 exports only the query span). Plans with more nodes (for example thousands of partitions) are cut off, see [Exported spans](#exported-spans). |
 | `pg_otel.queue_size_kb` | int (kB) | `1024` | server start only | Size of the shared-memory span queue in kilobytes (64 to 1048576). Needs a restart because shared memory is allocated at startup. See [How spans are exported](#how-spans-are-exported). |
 
@@ -187,8 +187,8 @@ Plan node spans carry `db.system.name`, `postgresql.plan.*` (planner estimates
 and `postgresql.plan.relation`, the `schema.table` this node itself scans, if
 any) and `postgresql.instrumentation.*` (actual rows, loops, filtered rows,
 startup and total time in seconds) attributes, plus `span.duration.us` in
-microseconds. The query span's name lists all relations of the plan nodes that
-have a span.
+microseconds. The query span's name is the normalized statement, cut to 256
+bytes.
 
 Attributes that describe how a plan node fits into the plan (present when they
 apply):
@@ -232,14 +232,65 @@ If you have dashboards or alerts on earlier versions of this extension:
 | `span.duration.us` | now really microseconds (it used to be off by a factor of 1000 or 1e6) |
 | span timestamps and durations | converted from Postgres' clock ticks to nanoseconds (they were wrong on machines where the ticks are not nanoseconds) |
 | span names | no longer cut to 64 characters (now 256 bytes) |
+| query span start and duration | the query span now starts when planning starts and `span.duration.us` covers planning plus execution (it used to be the execution time only); the execution time is `postgresql.execution.duration.us`. A new `planning` child span is exported, and `pg_otel.min_duration_ms` is compared with planning plus execution |
 | plans | nodes below `Append`, `MergeAppend`, `BitmapAnd`/`BitmapOr`, `SubqueryScan`, `CustomScan`, and init plans / sub-plans now have spans (they were missing); the number of spans per statement grows accordingly |
 
-Timing notes: Postgres only records accumulated durations, not wall-clock
-timestamps, per plan node. The query span starts at the time the statement began
-executing (derived from the end time and the measured duration) and plan node
-spans all start at that same instant; each ends after its accumulated run time.
-The duration covers executor run and finish, not parsing, planning or executor
-startup. `EXPLAIN` without `ANALYZE` is not traced.
+### Planning
+
+When a statement was planned in the current transaction, its query span has a
+child span named `planning` (kind internal) that covers the planner's run, and
+the query span **starts when planning starts**:
+
+```text
+query span   |<- planning ->|<- gap ->|<------ execution ------>|
+plan nodes                            |<- from execution start ->|
+```
+
+* The `planning` span has `postgresql.planning.duration.us`, `span.duration.us`
+  and `span.subtype = planning`. It is not a plan node span and does not count
+  towards `pg_otel.max_plan_spans`.
+* The query span has `postgresql.planning.duration.us` (if planning was
+  measured) and `postgresql.execution.duration.us` (the time in executor run
+  and finish, the same as `postgresql.execution.total_time_seconds`).
+  `span.duration.us` is the duration of the whole query span, so it is at least
+  planning plus execution; the *gap* is executor startup and, with the extended
+  protocol, the time between Bind (where the plan is made) and Execute.
+  Neither child span covers it.
+* Plan node spans start when execution starts, not when planning starts.
+* **`pg_otel.min_duration_ms` is compared with planning plus execution.** A
+  statement with a slow planner and a fast executor is traced. Parsing,
+  analysis and executor startup are not part of that sum.
+* Nested planning (for example a function evaluated during constant folding
+  that runs queries) is measured separately for each plan; the outer duration
+  includes the inner ones.
+
+**Cached plans.** Planning is only reported for the execution that made the
+plan. A prepared statement with a generic plan, or a statement saved by
+PL/pgSQL, gets a `planning` span for the execution that builds the plan and none
+for later executions, because they do not plan. Custom plans are planned (and
+reported) on every execution. A plan that was made in an earlier transaction
+and is executed later has no planning span either, since planning times are
+only remembered until the end of the (sub)transaction. `EXPLAIN` without
+`ANALYZE` is not traced and its planning time is not carried over to later
+statements.
+
+How planning is matched with its execution: the planner hook remembers each
+result in a small per-backend table (at most 64 entries, oldest evicted first)
+under a fingerprint of the plan (query id, statement position and length, cost
+and row estimates). The plan cache copies plans after planning, so the address
+of the planned statement cannot serve as the key. The entry is removed when the
+statement finishes. The table is cleared when the transaction ends, entries of a
+rolled back sub-transaction are dropped, and a planner error leaves nothing
+behind, since nothing is stored until the planner has returned.
+
+### Timing notes
+
+Postgres only records accumulated durations, not wall-clock timestamps, per plan
+node. Execution starts at the time derived from the end time and the measured
+execution duration, and plan node spans all start at that same instant; each
+ends after its accumulated run time. The measured execution duration covers
+executor run and finish, not parsing, analysis or executor startup (planning
+is reported separately, see above). `EXPLAIN` without `ANALYZE` is not traced.
 
 ## Supported PostgreSQL versions
 

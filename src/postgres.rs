@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeSet, HashSet},
+    collections::HashSet,
     ffi::CStr,
     panic::AssertUnwindSafe,
     sync::atomic::{AtomicBool, Ordering},
@@ -17,10 +17,10 @@ use crate::{
     codec::encode_batch,
     compat,
     config::{get_max_plan_spans, get_min_duration_ms, get_otlp_traceparent, get_query_text_mode},
-    shared,
+    planning, shared,
     span::{
-        ChildEdge, ParentContext, PlanChild, Relationship, SpanLink, SpanRecord, parse_traceparent,
-        random_span_id, walk_plan,
+        ChildEdge, ParentContext, PlanChild, Relationship, SpanLink, SpanRecord, Timeline,
+        parse_traceparent, random_span_id, walk_plan,
     },
 };
 
@@ -33,7 +33,7 @@ fn tracing_enabled(min_duration_ms: i32, parallel_worker_number: i32) -> bool {
     min_duration_ms >= 0 && parallel_worker_number < 0
 }
 
-fn tracing_enabled_here() -> bool {
+pub(crate) fn tracing_enabled_here() -> bool {
     // SAFETY: plain reads of backend-local variables.
     tracing_enabled(get_min_duration_ms(), unsafe {
         pg_sys::ParallelWorkerNumber
@@ -57,6 +57,13 @@ fn wants_instrumentation(query_desc: *mut pg_sys::QueryDesc, eflags: i32) -> boo
 /// Does nothing when tracing is disabled or for `EXPLAIN` without `ANALYZE`,
 /// so such statements pay no instrumentation overhead.
 pub fn request_instrumentation(query_desc: *mut pg_sys::QueryDesc, eflags: i32) {
+    if !query_desc.is_null() && is_explain_only(eflags) {
+        // A plan that is only explained is never executed, so nothing would
+        // ever consume its planning time; drop it so it cannot be attached to
+        // a later, unrelated plan.
+        // SAFETY: non-null `query_desc` of the statement about to start.
+        let _ = unsafe { planning::take_for(query_desc) };
+    }
     if wants_instrumentation(query_desc, eflags) {
         // SAFETY: non-null `query_desc` of the statement about to start.
         unsafe { compat::request_instrumentation_before_start(query_desc) };
@@ -117,7 +124,14 @@ fn report_collection_failure(error: &pgrx::pg_sys::panic::CaughtError) {
 }
 
 fn collect_spans_unguarded(query_desc: *mut pg_sys::QueryDesc) {
-    if query_desc.is_null() || !tracing_enabled_here() {
+    if query_desc.is_null() {
+        return;
+    }
+    // Consume the planning time of this plan before any early return, so it can
+    // never be attached to another statement later.
+    // SAFETY: non-null `query_desc` in ExecutorEnd.
+    let planning = unsafe { planning::take_for(query_desc) };
+    if !tracing_enabled_here() {
         return;
     }
     fault::inject();
@@ -132,19 +146,24 @@ fn collect_spans_unguarded(query_desc: *mut pg_sys::QueryDesc) {
         return;
     }
 
-    // Use the current time to calculate the start of the query. This is close
+    // Use the current time to calculate the start of execution. This is close
     // enough to the actual end time. The measured total is the time spent in
     // ExecutorRun and ExecutorFinish (not ExecutorStart/End). There is none when
     // instrumentation was not requested (tracing was disabled at ExecutorStart).
     let end_time = SystemTime::now();
     // SAFETY: `query_desc` is non-null and valid in ExecutorEnd.
-    let Some(total_ns) = (unsafe { compat::query_total_ns(&*query_desc) }) else {
+    let Some(exec_ns) = (unsafe { compat::query_total_ns(&*query_desc) }) else {
         return;
     };
-    if !meets_slow_query_threshold(total_ns, get_min_duration_ms()) {
+    let planning_ns = planning.map(|timing| timing.duration_ns);
+    if !meets_slow_query_threshold(
+        total_duration_ns(exec_ns, planning_ns),
+        get_min_duration_ms(),
+    ) {
         return;
     }
-    let wall_start = end_time - Duration::from_nanos(total_ns as u64);
+    let exec_start = end_time - Duration::from_nanos(exec_ns as u64);
+    let timeline = Timeline::new(planning, exec_start, end_time);
 
     let source_text = pg_str(unsafe { (*query_desc).sourceText });
     let guc_traceparent = get_otlp_traceparent();
@@ -160,28 +179,44 @@ fn collect_spans_unguarded(query_desc: *mut pg_sys::QueryDesc) {
     let query_link = SpanLink {
         trace_id: parent.trace_id,
         span_id: query_span_id,
-        end_time: wall_start + Duration::from_nanos(total_ns as u64),
+        end_time: timeline.end,
     };
     let planstate = unsafe { (*query_desc).planstate };
-    let PlanSpans {
-        mut spans,
-        tables,
-        omitted,
-    } = collect_plan_spans(planstate, wall_start, &query_link, get_max_plan_spans());
+    let PlanSpans { mut spans, omitted } = collect_plan_spans(
+        planstate,
+        timeline.exec_start,
+        &query_link,
+        get_max_plan_spans(),
+    );
+    // The planning span is not a plan node span: it does not count against
+    // `pg_otel.max_plan_spans`.
+    if let (Some(planning_span), Some(timing)) = (timeline.planning, planning) {
+        spans.push(SpanRecord::planning(
+            &query_link,
+            planning_span,
+            timing.duration_ns,
+        ));
+    }
 
     let Some(query_span) = SpanRecord::from_query(
         query_desc,
-        wall_start,
+        &timeline,
+        planning_ns,
         &parent,
         get_query_text_mode(),
         query_span_id,
-        &tables,
         omitted,
     ) else {
         return;
     };
     spans.push(query_span);
     publish_spans(spans);
+}
+
+/// What `pg_otel.min_duration_ms` is compared with: planning plus execution.
+/// Parsing and executor startup are not included.
+fn total_duration_ns(exec_ns: i64, planning_ns: Option<i64>) -> i64 {
+    exec_ns.saturating_add(planning_ns.unwrap_or(0).max(0))
 }
 
 /// `-1` disables tracing, `0` traces every statement.
@@ -209,8 +244,6 @@ fn publish_spans(spans: Vec<SpanRecord>) {
 struct PlanSpans {
     /// Parents come before their children.
     spans: Vec<SpanRecord>,
-    /// Relations scanned by the nodes that got a span.
-    tables: BTreeSet<String>,
     /// Plan nodes without a span because `max_spans` was reached.
     omitted: usize,
 }
@@ -227,7 +260,6 @@ fn collect_plan_spans(
 ) -> PlanSpans {
     let mut result = PlanSpans {
         spans: Vec::new(),
-        tables: BTreeSet::new(),
         omitted: 0,
     };
     if planstate.is_null() {
@@ -244,9 +276,6 @@ fn collect_plan_spans(
         |&node| unsafe { plan_state_children(node, &mut printed_subplans) },
         |&node, edge, parent| {
             let span = SpanRecord::from_plan(node, wall_start, &parent.unwrap_or(*query), edge)?;
-            if let Some(relation) = span.relation() {
-                result.tables.insert(relation.to_owned());
-            }
             let link = span.link();
             result.spans.push(span);
             Some(link)
@@ -941,6 +970,23 @@ mod unit_tests {
     }
 
     #[test]
+    fn planning_counts_towards_the_threshold_total() {
+        assert_eq!(total_duration_ns(5, None), 5);
+        assert_eq!(total_duration_ns(5, Some(7)), 12);
+        assert_eq!(total_duration_ns(i64::MAX, Some(1)), i64::MAX);
+        assert_eq!(total_duration_ns(5, Some(-3)), 5);
+        // 0.6 ms of execution alone misses 1 ms, with 0.5 ms of planning it passes.
+        assert!(!meets_slow_query_threshold(
+            total_duration_ns(600_000, None),
+            1
+        ));
+        assert!(meets_slow_query_threshold(
+            total_duration_ns(600_000, Some(500_000)),
+            1
+        ));
+    }
+
+    #[test]
     fn explain_only_flag_is_detected() {
         assert!(is_explain_only(pg_sys::EXEC_FLAG_EXPLAIN_ONLY as i32));
         assert!(is_explain_only(
@@ -1018,24 +1064,30 @@ mod tests {
     #[pg_test]
     fn normalized_query_text_hides_literals() {
         let spans = traced_spans("SELECT 'secret_value_xyz'::text");
-        let text = query_text(query_span(&spans)).expect("query text");
+        let span = query_span(&spans);
+        let text = query_text(span).expect("query text");
         assert!(!text.contains("secret_value_xyz"), "{text}");
         assert!(text.contains("$1"), "{text}");
+        assert_eq!(span.name, text);
     }
 
     #[pg_test]
-    fn raw_query_text_is_exported_as_is() {
+    fn raw_query_text_is_exported_as_is_but_root_name_is_normalized() {
         Spi::run("SET pg_otel.query_text = 'raw'").unwrap();
         let spans = traced_spans("SELECT 'secret_value_xyz'::text");
-        let text = query_text(query_span(&spans)).expect("query text");
+        let span = query_span(&spans);
+        let text = query_text(span).expect("query text");
         assert!(text.contains("secret_value_xyz"), "{text}");
+        assert_eq!(span.name, "SELECT $1::text");
     }
 
     #[pg_test]
-    fn off_query_text_exports_no_text() {
+    fn off_query_text_exports_no_text_but_root_name_is_normalized() {
         Spi::run("SET pg_otel.query_text = 'off'").unwrap();
         let spans = traced_spans("SELECT 'secret_value_xyz'::text");
-        assert!(attr(query_span(&spans), "db.query.text").is_none());
+        let query = query_span(&spans);
+        assert!(attr(query, "db.query.text").is_none());
+        assert_eq!(query.name, "SELECT $1::text");
         for span in &spans {
             assert!(!format!("{:?}", span.attributes).contains("secret_value_xyz"));
         }
@@ -1072,7 +1124,7 @@ mod tests {
         let spans = traced_spans("SELECT pg_sleep(0.05)");
         let measured_us = started.elapsed().as_micros() as f64;
         let span = query_span(&spans);
-        let micros = number(span, "span.duration.us");
+        let micros = number(span, "postgresql.execution.duration.us");
         assert!((40_000.0..5_000_000.0).contains(&micros), "{micros}us");
         // Raw TSC ticks mistaken for nanoseconds would exceed the real wall
         // time measured independently here. The slack absorbs TSC calibration
@@ -1083,8 +1135,17 @@ mod tests {
         );
         let seconds = number(span, "postgresql.execution.total_time_seconds");
         assert!((micros / 1e6 - seconds).abs() < 1e-9);
+        // `span.duration.us` is the duration of the whole span: planning and
+        // execution plus the gaps between them.
+        let total = number(span, "span.duration.us");
         let wall = span.end_time.duration_since(span.start_time).unwrap();
-        assert_eq!(wall.as_micros() as f64, micros.floor());
+        assert_eq!(wall.as_micros() as f64, total.floor());
+        let planning = number(span, "postgresql.planning.duration.us");
+        assert!(
+            total >= micros + planning - 1.0,
+            "{total} < {micros} + {planning}"
+        );
+        assert!(total <= measured_us * 1.05 + 1_000.0);
     }
 
     #[pg_test]
@@ -1102,7 +1163,9 @@ mod tests {
         assert_eq!(number(scan, "postgresql.instrumentation.loops"), 1.0);
         assert!(number(scan, "span.duration.us") >= 0.0);
         assert_eq!(scan.parent_span_id, query.span_context.span_id());
-        assert_eq!(scan.start_time, query.start_time);
+        // Plan nodes start when execution starts, after planning.
+        let planning = planning_span(&spans).expect("a planning span");
+        assert!(scan.start_time >= planning.end_time);
         assert!(scan.end_time <= query.end_time);
     }
 
@@ -1132,10 +1195,9 @@ mod tests {
                 .iter()
                 .all(|s| attr(s, "postgresql.plan.relation").is_none())
         );
-        // The query span still names every relation, computed once for the plan.
         assert_eq!(
             query_span(&spans).name,
-            "SELECT pg_temp.otel_a, pg_temp.otel_b"
+            "SELECT * FROM otel_a a JOIN otel_b b USING (i)"
         );
     }
 
@@ -1219,6 +1281,36 @@ mod tests {
         for _ in 0..20 {
             assert_eq!(query_value("SELECT 1"), Some(1));
         }
+    }
+
+    fn planning_span(spans: &[SpanData]) -> Option<&SpanData> {
+        spans
+            .iter()
+            .find(|s| text_attr(s, "span.subtype").as_deref() == Some("planning"))
+    }
+
+    fn planning_spans(spans: &[SpanData]) -> usize {
+        spans
+            .iter()
+            .filter(|s| text_attr(s, "span.subtype").as_deref() == Some("planning"))
+            .count()
+    }
+
+    /// Like `traced_spans` but leaves `pg_otel.min_duration_ms` as it is.
+    fn captured_spans(sql: &str) -> Vec<SpanData> {
+        capture::start();
+        let result = Spi::run(sql);
+        let spans = capture::finish();
+        result.unwrap();
+        spans.into_iter().map(SpanData::from).collect()
+    }
+
+    /// A constant function that takes 150 ms *at plan time*: the planner calls
+    /// immutable functions with constant arguments while folding constants.
+    #[pg_extern(immutable)]
+    fn otel_slow_constant() -> i32 {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        1
     }
 
     fn node_type(span: &SpanData) -> Option<String> {
@@ -1544,6 +1636,115 @@ mod tests {
         .unwrap()
         .expect("pg_stat_statements recorded the statement");
         assert!(blocks > 0, "no buffer usage recorded: {blocks}");
+    }
+
+    #[pg_test]
+    fn statements_get_a_planning_span_before_execution() {
+        Spi::run("CREATE TEMP TABLE otel_plan_t AS SELECT 1 AS i").unwrap();
+        let spans = traced_spans("SELECT * FROM otel_plan_t");
+        assert_eq!(planning_spans(&spans), 1);
+        let query = query_span(&spans);
+        let planning = planning_span(&spans).unwrap();
+        assert_eq!(planning.name, "planning");
+        assert_eq!(planning.parent_span_id, query.span_context.span_id());
+        assert_eq!(
+            planning.span_context.trace_id(),
+            query.span_context.trace_id()
+        );
+        // The query span starts with planning.
+        assert_eq!(planning.start_time, query.start_time);
+        assert!(planning.end_time >= planning.start_time);
+        // Execution (the plan nodes) starts after planning ended.
+        let nodes = plan_nodes(&spans);
+        assert!(!nodes.is_empty());
+        assert!(nodes.iter().all(|n| n.start_time >= planning.end_time));
+        assert!(query.end_time >= planning.end_time);
+        // Attributes.
+        let planning_us = number(planning, "postgresql.planning.duration.us");
+        assert!(planning_us >= 0.0);
+        assert_eq!(
+            number(query, "postgresql.planning.duration.us"),
+            planning_us
+        );
+        assert!(number(query, "postgresql.execution.duration.us") >= 0.0);
+        assert!(number(query, "span.duration.us") >= planning_us);
+        // It is not a plan node span.
+        assert!(attr(planning, "postgresql.plan.node_type").is_none());
+    }
+
+    #[pg_test]
+    fn cached_generic_plan_gets_a_planning_span_only_when_it_is_built() {
+        create_pair();
+        Spi::run("PREPARE otel_g AS SELECT i FROM otel_a WHERE i > $1").unwrap();
+        Spi::run("SET plan_cache_mode = force_generic_plan").unwrap();
+        // The generic plan is built by the first EXECUTE (the plan cache copies
+        // the plan after planning, so matching must not rely on the pointer).
+        let first = traced_spans("EXECUTE otel_g(0)");
+        assert_eq!(planning_spans(&first), 1);
+        // Executing the cached plan again does not plan again.
+        let second = traced_spans("EXECUTE otel_g(0)");
+        assert_eq!(planning_spans(&second), 0);
+        assert!(attr(query_span(&second), "postgresql.planning.duration.us").is_none());
+        // The query span then starts with execution.
+        let first_node = plan_nodes(&second)[0];
+        assert_eq!(query_span(&second).start_time, first_node.start_time);
+    }
+
+    #[pg_test]
+    fn custom_plans_are_planned_for_every_execution() {
+        create_pair();
+        Spi::run("PREPARE otel_c AS SELECT i FROM otel_a WHERE i > $1").unwrap();
+        Spi::run("SET plan_cache_mode = force_custom_plan").unwrap();
+        assert_eq!(planning_spans(&traced_spans("EXECUTE otel_c(0)")), 1);
+        assert_eq!(planning_spans(&traced_spans("EXECUTE otel_c(1)")), 1);
+    }
+
+    #[pg_test]
+    fn errors_in_planning_and_execution_leave_no_stale_state() {
+        create_pair();
+        Spi::run("SET pg_otel.min_duration_ms = 0").unwrap();
+        let before = crate::planning::pending_len();
+        // One statement fails in the planner (constant folding divides by
+        // zero), one after it was planned (at run time); both inside a
+        // sub-transaction that is rolled back.
+        Spi::run(
+            "DO $$ BEGIN
+               BEGIN EXECUTE 'SELECT 1/0'; EXCEPTION WHEN division_by_zero THEN NULL; END;
+               BEGIN EXECUTE 'SELECT 1/(i-1) FROM otel_a'; EXCEPTION WHEN division_by_zero THEN NULL; END;
+             END $$",
+        )
+        .unwrap();
+        assert_eq!(crate::planning::pending_len(), before);
+        // Later statements are traced normally.
+        let spans = traced_spans("SELECT * FROM otel_a");
+        assert_eq!(planning_spans(&spans), 1);
+        assert_eq!(crate::planning::pending_len(), before);
+    }
+
+    #[pg_test]
+    fn explain_without_analyze_leaves_no_pending_plan() {
+        create_pair();
+        Spi::run("SET pg_otel.min_duration_ms = 0").unwrap();
+        let before = crate::planning::pending_len();
+        capture::start();
+        Spi::run("EXPLAIN SELECT * FROM otel_a").unwrap();
+        assert!(capture::finish().is_empty());
+        assert_eq!(crate::planning::pending_len(), before);
+        // The identical statement, executed afterwards, is planned again.
+        let spans = traced_spans("SELECT * FROM otel_a");
+        assert_eq!(planning_spans(&spans), 1);
+    }
+
+    #[pg_test]
+    fn planning_time_counts_towards_the_threshold() {
+        Spi::run("SET pg_otel.min_duration_ms = 100").unwrap();
+        // Planning takes 150 ms, execution microseconds: only the sum passes.
+        let slow_plan = captured_spans("SELECT tests.otel_slow_constant()");
+        let query = query_span(&slow_plan);
+        assert!(number(query, "postgresql.planning.duration.us") >= 100_000.0);
+        assert!(number(query, "postgresql.execution.duration.us") < 100_000.0);
+        // A fast statement is still filtered out.
+        assert!(captured_spans("SELECT 1").is_empty());
     }
 
     #[pg_test]

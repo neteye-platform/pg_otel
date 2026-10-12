@@ -17,12 +17,13 @@ use opentelemetry::{SpanId, TraceId};
 
 use crate::{
     queue::{Batch, records},
-    span::{PlanNodeAttributes, QueryAttributes, SpanAttributes, SpanRecord},
+    span::{PlanNodeAttributes, PlanningAttributes, QueryAttributes, SpanAttributes, SpanRecord},
 };
 
-const FORMAT_VERSION: u8 = 2;
+const FORMAT_VERSION: u8 = 3;
 const KIND_QUERY: u8 = 1;
 const KIND_PLAN_NODE: u8 = 2;
+const KIND_PLANNING: u8 = 3;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum DecodeError {
@@ -53,6 +54,7 @@ pub fn encode_span(span: &SpanRecord, out: &mut Vec<u8>) {
     out.push(match span.attributes {
         SpanAttributes::Query(_) => KIND_QUERY,
         SpanAttributes::PlanNode(_) => KIND_PLAN_NODE,
+        SpanAttributes::Planning(_) => KIND_PLANNING,
     });
     out.extend_from_slice(&span.trace_id.to_bytes());
     out.extend_from_slice(&span.span_id.to_bytes());
@@ -63,6 +65,7 @@ pub fn encode_span(span: &SpanRecord, out: &mut Vec<u8>) {
     match &span.attributes {
         SpanAttributes::Query(query) => encode_query(query, out),
         SpanAttributes::PlanNode(node) => encode_plan_node(node, out),
+        SpanAttributes::Planning(planning) => put_i64(out, planning.duration_ns),
     }
 }
 
@@ -72,6 +75,7 @@ fn encode_query(query: &QueryAttributes, out: &mut Vec<u8>) {
     put_opt_str(out, query.query_text.as_deref());
     put_i64(out, query.query_id);
     put_i64(out, query.exec_total_time_ns);
+    put_opt_i64(out, query.planning_time_ns);
     put_u64(out, query.plan_spans_omitted);
 }
 
@@ -117,6 +121,9 @@ pub fn decode_span(bytes: &[u8]) -> Result<SpanRecord, DecodeError> {
     let attributes = match kind {
         KIND_QUERY => SpanAttributes::Query(decode_query(&mut reader)?),
         KIND_PLAN_NODE => SpanAttributes::PlanNode(decode_plan_node(&mut reader)?),
+        KIND_PLANNING => SpanAttributes::Planning(PlanningAttributes {
+            duration_ns: reader.i64()?,
+        }),
         other => return Err(DecodeError::UnknownTag(other)),
     };
     if !reader.rest.is_empty() {
@@ -140,6 +147,7 @@ fn decode_query(reader: &mut Reader) -> Result<QueryAttributes, DecodeError> {
         query_text: reader.opt_string()?,
         query_id: reader.i64()?,
         exec_total_time_ns: reader.i64()?,
+        planning_time_ns: reader.opt_i64()?,
         plan_spans_omitted: reader.u64()?,
     })
 }
@@ -343,6 +351,7 @@ mod tests {
                 query_text: Some("SELECT * FROM t WHERE x = $1 -- é€😀".to_owned()),
                 query_id: -42,
                 exec_total_time_ns: 100_000_000,
+                planning_time_ns: Some(25_000),
                 plan_spans_omitted: 17,
             }),
         }
@@ -402,9 +411,24 @@ mod tests {
     }
 
     #[test]
+    fn planning_span_round_trips() {
+        let span = SpanRecord {
+            trace_id: TraceId::from(5),
+            span_id: SpanId::from(11),
+            parent_id: SpanId::from(7),
+            name: "planning".to_owned(),
+            start_time: UNIX_EPOCH + Duration::from_secs(5),
+            end_time: UNIX_EPOCH + Duration::from_secs(6),
+            attributes: SpanAttributes::Planning(PlanningAttributes { duration_ns: 123 }),
+        };
+        assert_eq!(decode_span(&encoded(&span)), Ok(span));
+    }
+
+    #[test]
     fn optional_fields_round_trip_when_absent() {
         let mut span = query_span();
         if let SpanAttributes::Query(query) = &mut span.attributes {
+            query.planning_time_ns = None;
             query.query_text = None;
         }
         assert_eq!(decode_span(&encoded(&span)), Ok(span));

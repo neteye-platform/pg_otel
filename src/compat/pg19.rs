@@ -2,7 +2,9 @@
 
 use pgrx::pg_sys::{self, NodeInstrumentation, PlanState, QueryDesc};
 
-use std::ffi::c_int;
+use std::ffi::{c_char, c_int};
+
+use pgrx::pg_guard;
 
 use super::{NodeInstrument, NodeStats, instrument_options, is_mid_timer};
 
@@ -139,6 +141,59 @@ pub unsafe fn log_min_messages_slot() -> Option<*mut c_int> {
             (&raw mut pg_sys::log_min_messages)
                 .cast::<c_int>()
                 .add(backend_type)
+        }
+    })
+}
+
+static mut PREV_PLANNER_HOOK: pg_sys::planner_hook_type = None;
+
+/// Installs the planner hook that times planning (see [`crate::planning`]),
+/// chaining to a previously installed hook or `standard_planner`. Call once
+/// from `_PG_init`.
+///
+/// The hook has a different signature on each version: PG19 passes the
+/// `ExplainState` of an `EXPLAIN` that is planning (null otherwise).
+pub fn install_planner_hook() {
+    // SAFETY: called once from _PG_init in the postmaster.
+    unsafe {
+        PREV_PLANNER_HOOK = pg_sys::planner_hook;
+        pg_sys::planner_hook = Some(planner_hook);
+    }
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn planner_hook(
+    parse: *mut pg_sys::Query,
+    query_string: *const c_char,
+    cursor_options: c_int,
+    bound_params: pg_sys::ParamListInfo,
+    explain_state: *mut pg_sys::ExplainState,
+) -> *mut pg_sys::PlannedStmt {
+    crate::planning::timed(|| {
+        // SAFETY: hooks are only changed in _PG_init, before they can run.
+        match unsafe { PREV_PLANNER_HOOK } {
+            // The previous hook is C code that may longjmp on ERROR: let pgrx
+            // turn that into an unwind through our frames.
+            Some(prev) => unsafe {
+                pg_sys::submodules::ffi::pg_guard_ffi_boundary(|| {
+                    prev(
+                        parse,
+                        query_string,
+                        cursor_options,
+                        bound_params,
+                        explain_state,
+                    )
+                })
+            },
+            None => unsafe {
+                pg_sys::standard_planner(
+                    parse,
+                    query_string,
+                    cursor_options,
+                    bound_params,
+                    explain_state,
+                )
+            },
         }
     })
 }

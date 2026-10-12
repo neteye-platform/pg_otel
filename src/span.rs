@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeSet,
     ptr,
     time::{Duration, SystemTime},
 };
@@ -15,6 +14,7 @@ use pgrx::pg_sys::{self, CmdType, PlanState, QueryDesc};
 use crate::{
     compat::{self, NodeInstrument, NodeStats},
     config::QueryTextMode,
+    planning::PlanningTiming,
     postgres::plan_table_name,
     sanitize,
 };
@@ -118,7 +118,11 @@ pub struct QueryAttributes {
     pub query_text: Option<String>,
     /// Postgres' query id; `0` means it was not computed.
     pub query_id: i64,
+    /// Time in ExecutorRun and ExecutorFinish.
     pub exec_total_time_ns: i64,
+    /// Time in the planner; `None` when the statement was not planned in this
+    /// transaction (a re-executed cached plan) or planning was not measured.
+    pub planning_time_ns: Option<i64>,
     /// Plan nodes without a span because `pg_otel.max_plan_spans` was reached;
     /// `0` when the plan is complete.
     pub plan_spans_omitted: u64,
@@ -162,8 +166,15 @@ pub struct PlanNodeAttributes {
     pub instr_rows_removed_by_other_filter: f64,
 }
 
+/// The `planning` span: the planner's run, a child of the query span.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlanningAttributes {
+    pub duration_ns: i64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum SpanAttributes {
+    Planning(PlanningAttributes),
     Query(QueryAttributes),
     PlanNode(PlanNodeAttributes),
 }
@@ -274,7 +285,70 @@ pub fn walk_plan<N, L: Copy>(
     summary
 }
 
+/// The wall-clock layout of a statement's spans.
+///
+/// ```text
+/// query span   |<- planning ->|<- gap ->|<------ execution ------>|
+/// plan nodes                            |<- from exec_start ----->|
+/// ```
+///
+/// The gap is executor startup, and, with the extended protocol, the time
+/// between Bind (where the plan is made) and Execute. It belongs to the query
+/// span but to none of its children.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Timeline {
+    /// Start of the query span: the start of planning if it was measured,
+    /// otherwise `exec_start`.
+    pub query_start: SystemTime,
+    /// Start and end of the `planning` span, if planning was measured.
+    pub planning: Option<(SystemTime, SystemTime)>,
+    /// Start of execution; plan node spans start here.
+    pub exec_start: SystemTime,
+    /// End of the query span and of execution.
+    pub end: SystemTime,
+}
+
+impl Timeline {
+    /// Places planning before execution. `exec_start` is derived from the
+    /// monotonic execution time and the wall clock at the end, so tiny
+    /// inconsistencies between the clocks are possible; planning is clamped so
+    /// that it never overlaps or follows execution.
+    pub fn new(planning: Option<PlanningTiming>, exec_start: SystemTime, end: SystemTime) -> Self {
+        let planning = planning.map(|timing| {
+            let start = timing.start.min(exec_start);
+            let planning_end = (timing.start
+                + Duration::from_nanos(timing.duration_ns.max(0) as u64))
+            .min(exec_start)
+            .max(start);
+            (start, planning_end)
+        });
+        Self {
+            query_start: planning.map_or(exec_start, |(start, _)| start),
+            planning,
+            exec_start,
+            end,
+        }
+    }
+}
+
 impl SpanRecord {
+    /// The `planning` span, a child of the query span `query`.
+    pub fn planning(
+        query: &SpanLink,
+        (start_time, end_time): (SystemTime, SystemTime),
+        duration_ns: i64,
+    ) -> Self {
+        SpanRecord {
+            trace_id: query.trace_id,
+            span_id: random_span_id(),
+            parent_id: query.span_id,
+            name: "planning".to_owned(),
+            start_time,
+            end_time,
+            attributes: SpanAttributes::Planning(PlanningAttributes { duration_ns }),
+        }
+    }
+
     pub fn link(&self) -> SpanLink {
         SpanLink {
             trace_id: self.trace_id,
@@ -287,26 +361,27 @@ impl SpanRecord {
     pub fn relation(&self) -> Option<&str> {
         match &self.attributes {
             SpanAttributes::PlanNode(node) => node.relation.as_deref(),
-            SpanAttributes::Query(_) => None,
+            SpanAttributes::Query(_) | SpanAttributes::Planning(_) => None,
         }
     }
 
     /// Builds the span of a whole statement.
     ///
-    /// The span covers `wall_start` up to the time Postgres spent in
-    /// ExecutorRun/Finish (see [`compat::query_total_ns`]). `span_id` is chosen by the
+    /// The span covers the [`Timeline`]: from the start of planning (if it was
+    /// measured) to the end of execution, whose duration is the time Postgres
+    /// spent in ExecutorRun/Finish (see [`compat::query_total_ns`]). `span_id`
+    /// is chosen by the
     /// caller so plan nodes can reference it as their parent before this span
-    /// exists, `tables` are the relations scanned by the plan, and `plan_spans_omitted` the
-    /// number of plan nodes left out of the trace. Calls into
-    /// Postgres to sanitize the query text, so it must not run while the span
-    /// queue lock is held.
+    /// exists, and `plan_spans_omitted` is the number of plan nodes left out of
+    /// the trace. Calls into Postgres to sanitize the query text, so it must not
+    /// run while the span queue lock is held.
     pub fn from_query(
         query_desc: *const QueryDesc,
-        wall_start: SystemTime,
+        timeline: &Timeline,
+        planning_time_ns: Option<i64>,
         parent: &ParentContext,
         query_text_mode: QueryTextMode,
         span_id: SpanId,
-        tables: &BTreeSet<String>,
         plan_spans_omitted: usize,
     ) -> Option<Self> {
         let query_desc = unsafe { query_desc.as_ref()? };
@@ -314,31 +389,29 @@ impl SpanRecord {
         let total_ns = unsafe { compat::query_total_ns(query_desc)? };
 
         let operation = query_name(query_desc.operation);
-        let name = format!(
-            "{operation} {}",
-            tables
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-
-        let end_time = wall_start + Duration::from_nanos(total_ns as u64);
-        let (query_text, query_id) = exported_query_text_and_id(query_desc, query_text_mode);
+        let (normalized_query, query_text, query_id) =
+            query_texts_and_id(query_desc, query_text_mode);
+        // The root span name is always normalized, even when `query_text` is
+        // raw or disabled, so span names cannot expose literal values.
+        let name = normalized_query
+            .as_deref()
+            .map(|query| truncated(query, NAME_MAX_LEN))
+            .unwrap_or_else(|| operation.to_owned());
 
         Some(SpanRecord {
             trace_id: parent.trace_id,
             span_id,
             parent_id: parent.span_id,
-            name: truncated(&name, NAME_MAX_LEN),
-            start_time: wall_start,
-            end_time,
+            name,
+            start_time: timeline.query_start,
+            end_time: timeline.end,
             attributes: SpanAttributes::Query(QueryAttributes {
                 parent_is_remote: parent.is_remote,
                 operation: operation.to_owned(),
                 query_text,
                 query_id,
                 exec_total_time_ns: total_ns,
+                planning_time_ns,
                 plan_spans_omitted: plan_spans_omitted as u64,
             }),
         })
@@ -478,39 +551,46 @@ fn truncated(s: &str, max_bytes: usize) -> String {
     sanitize::truncate_utf8(s, max_bytes).to_owned()
 }
 
-/// Query text to export and the query id, according to `mode`.
-fn exported_query_text_and_id(
+/// Normalized query text, exported query text, and query id.
+///
+/// Normalization is always attempted for the root span name. The exported text
+/// still follows `mode`: it can be the same normalized value, raw text, or be
+/// absent entirely.
+fn query_texts_and_id(
     query_desc: &QueryDesc,
     mode: QueryTextMode,
-) -> (Option<String>, i64) {
+) -> (Option<String>, Option<String>, i64) {
     // SAFETY: `plannedstmt` is null or valid for the duration of the hook.
     let (stmt_location, stmt_len, query_id) = match unsafe { query_desc.plannedstmt.as_ref() } {
         Some(stmt) => (stmt.stmt_location, stmt.stmt_len, stmt.queryId),
         None => (-1, 0, 0),
     };
-    let text = normalize_for(mode).and_then(|normalize| {
-        // SAFETY: `sourceText` is null or a NUL-terminated string that outlives
-        // the hook. `sanitize` truncates to `QUERY_TEXT_MAX_LEN`.
-        unsafe {
+    // SAFETY: `sourceText` is null or a NUL-terminated string that outlives
+    // the hook. `sanitize` truncates to `QUERY_TEXT_MAX_LEN`.
+    let normalized = unsafe {
+        sanitize::sanitize(
+            query_desc.sourceText,
+            stmt_location,
+            stmt_len,
+            true,
+            QUERY_TEXT_MAX_LEN,
+        )
+    };
+    let text = match mode {
+        QueryTextMode::Off => None,
+        QueryTextMode::Normalized => normalized.clone(),
+        // SAFETY: same source-text contract as above.
+        QueryTextMode::Raw => unsafe {
             sanitize::sanitize(
                 query_desc.sourceText,
                 stmt_location,
                 stmt_len,
-                normalize,
+                false,
                 QUERY_TEXT_MAX_LEN,
             )
-        }
-    });
-    (text, query_id)
-}
-
-/// Whether the query text must be normalized; `None` means "do not export".
-fn normalize_for(mode: QueryTextMode) -> Option<bool> {
-    match mode {
-        QueryTextMode::Off => None,
-        QueryTextMode::Normalized => Some(true),
-        QueryTextMode::Raw => Some(false),
-    }
+        },
+    };
+    (normalized, text, query_id)
 }
 
 /// Seconds, for the `*_time_seconds` attributes.
@@ -550,7 +630,37 @@ impl From<SpanRecord> for SpanData {
             .with_version(env!("CARGO_PKG_VERSION"))
             .build();
 
+        // The whole span, which for a statement includes planning and the gaps.
+        let span_duration_ns = span
+            .end_time
+            .duration_since(span.start_time)
+            .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
+
         match span.attributes {
+            SpanAttributes::Planning(attr) => SpanData {
+                span_context,
+                parent_span_id: span.parent_id,
+                parent_span_is_remote: false,
+                span_kind: SpanKind::Internal,
+                name: span.name.into(),
+                start_time: span.start_time,
+                end_time: span.end_time,
+                attributes: vec![
+                    KeyValue::new("db.system.name", "postgresql"),
+                    KeyValue::new(
+                        "postgresql.planning.duration.us",
+                        ns_to_micros(attr.duration_ns),
+                    ),
+                    KeyValue::new("span.duration.us", ns_to_micros(span_duration_ns)),
+                    KeyValue::new("span.type", "db"),
+                    KeyValue::new("span.subtype", "planning"),
+                ],
+                dropped_attributes_count: 0,
+                events: Default::default(),
+                links: Default::default(),
+                status: Status::Ok,
+                instrumentation_scope,
+            },
             SpanAttributes::Query(attr) => {
                 let mut attributes = vec![
                     KeyValue::new("db.operation.name", attr.operation),
@@ -559,10 +669,20 @@ impl From<SpanRecord> for SpanData {
                         "postgresql.execution.total_time_seconds",
                         ns_to_seconds(attr.exec_total_time_ns),
                     ),
-                    KeyValue::new("span.duration.us", ns_to_micros(attr.exec_total_time_ns)),
+                    KeyValue::new(
+                        "postgresql.execution.duration.us",
+                        ns_to_micros(attr.exec_total_time_ns),
+                    ),
+                    KeyValue::new("span.duration.us", ns_to_micros(span_duration_ns)),
                     KeyValue::new("span.type", "db"),
                     KeyValue::new("span.subtype", "postgresql"),
                 ];
+                if let Some(planning_ns) = attr.planning_time_ns {
+                    attributes.push(KeyValue::new(
+                        "postgresql.planning.duration.us",
+                        ns_to_micros(planning_ns),
+                    ));
+                }
                 if let Some(query_text) = attr.query_text {
                     attributes.push(KeyValue::new("db.query.text", query_text));
                 }
@@ -1008,18 +1128,52 @@ mod tests {
         );
     }
 
+    fn at(ms: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_millis(1_000_000 + ms)
+    }
+
+    fn timing(start_ms: u64, duration_ms: i64) -> PlanningTiming {
+        PlanningTiming {
+            start: at(start_ms),
+            duration_ns: duration_ms * 1_000_000,
+        }
+    }
+
+    #[test]
+    fn timeline_without_planning_starts_with_execution() {
+        let timeline = Timeline::new(None, at(10), at(20));
+        assert_eq!(timeline.query_start, at(10));
+        assert_eq!(timeline.planning, None);
+        assert_eq!((timeline.exec_start, timeline.end), (at(10), at(20)));
+    }
+
+    #[test]
+    fn timeline_starts_the_query_with_planning() {
+        let timeline = Timeline::new(Some(timing(0, 4)), at(10), at(20));
+        assert_eq!(timeline.query_start, at(0));
+        assert_eq!(timeline.planning, Some((at(0), at(4))));
+        assert_eq!(timeline.exec_start, at(10));
+    }
+
+    #[test]
+    fn timeline_never_lets_planning_overlap_execution() {
+        // Planning "ends" after execution started (clock inconsistency).
+        let timeline = Timeline::new(Some(timing(5, 20)), at(10), at(30));
+        assert_eq!(timeline.planning, Some((at(5), at(10))));
+        // Planning "starts" after execution started.
+        let timeline = Timeline::new(Some(timing(12, 3)), at(10), at(30));
+        assert_eq!(timeline.planning, Some((at(10), at(10))));
+        assert_eq!(timeline.query_start, at(10));
+        // A negative duration is treated as zero.
+        let timeline = Timeline::new(Some(timing(2, -5)), at(10), at(30));
+        assert_eq!(timeline.planning, Some((at(2), at(2))));
+    }
+
     #[test]
     fn duration_units_are_seconds_and_microseconds() {
         assert_eq!(ns_to_seconds(1_500_000_000), 1.5);
         assert_eq!(ns_to_micros(1_500_000), 1_500.0);
         assert_eq!(ns_to_micros(0), 0.0);
-    }
-
-    #[test]
-    fn query_text_modes_map_to_normalization() {
-        assert_eq!(normalize_for(QueryTextMode::Off), None);
-        assert_eq!(normalize_for(QueryTextMode::Normalized), Some(true));
-        assert_eq!(normalize_for(QueryTextMode::Raw), Some(false));
     }
 
     #[test]
